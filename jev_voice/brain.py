@@ -17,21 +17,25 @@ import httpx
 from . import actions, config
 
 ACTIONS: dict[str, str] = {
-    "open_app": "Launch, open, switch to, or bring up an application program on the Mac (for example Chrome, Cursor, Slack, Finder, Terminal, Notes)",
-    "open_website": "Go to a website or web page by name or domain, with no search query (for example 'go to youtube', 'open reddit', 'pull up gmail')",
-    "web_search": "Search for something on the web or on a specific site: Google it, look it up, find videos of, search YouTube for, search Amazon for",
-    "type_text": "Type, write, dictate, or enter some text into whatever is currently focused",
+    "open_app": "Launch, open, switch to, or bring up an application program on the Mac (for example Chrome, Cursor, Slack, Finder, Terminal, Notes). Quitting or closing an application is not this. Switching a browser's user profile is switch_profile, not this.",
+    "close_app": "Quit or close an application program entirely (for example 'close chrome', 'quit notes', 'exit slack', 'close this app', 'close the current app'). Closing a tab, a window, or a dialog is not this.",
+    "open_website": "Go to a website or web page by name or domain, with no search query (for example 'go to youtube', 'open reddit', 'pull up gmail'). Writing or typing a domain into an app is screen, not this. A site that is already one of the open tabs in `tabs` is switch_tab, not this.",
+    "web_search": "Search for something on the web or on a specific site: Google it, look it up, find videos of, search YouTube for, search Amazon for. Typing text into a field without searching is screen, not this.",
+    "type_text": "Type, write, or dictate into the text area that is already open, with no application named. If `focused_field` is true, what they say is the text to insert into that field, even when they never say 'write', unless they clearly ask for a different action. 'I want you to write good morning' inserts good morning. If they name the app to type in, or a control to click, that is screen.",
+    "screen": "Look at an application's own window and either type text into one of its text fields or click one of its controls. Examples: 'write youtube.com on google chrome' (type those characters, do not search and do not open the page), 'type hello in notes', 'click the image on photo booth'. This is one app's visible controls, not a website, not a web search, and not a keyboard shortcut.",
     "new_item": "Create something new inside an app: a new note, document, file, tab, window, message, email, or page (for example 'new note', 'open a new note in the notes app', 'make a new note called groceries', 'new document')",
-    "shortcut": "Press a single key or keyboard shortcut: enter, escape, tab, copy, paste, undo, save, select all, new tab, close tab, reload, go back, quit the app, switch app, and similar",
+    "switch_tab": "Switch to a browser tab that is already open on this desktop, in that same browser (for example 'switch to the youtube tab', 'go to the gmail tab', 'the github tab', 'the other tab'). The open tabs are listed in `tabs`. Opening a page that is not already a tab is open_website. Next or previous, with no tab named, is a shortcut. A browser profile is switch_profile, not this.",
+    "switch_profile": "Switch a browser to a different user profile when that browser has more than one, listed in `profiles`. Examples: 'switch profile', 'go to another profile', 'the other profile', 'switch to the work profile', 'change brave profile'. A tab is switch_tab. Opening the browser itself is open_app.",
+    "shortcut": "Press a single key or keyboard shortcut: enter, escape, tab, copy, paste, undo, save, select all, new tab, close a tab or window, reload, go back, switch app, and similar. Quitting an application is close_app, not a shortcut. Switching to a named open tab is switch_tab, not a shortcut.",
     "scroll": "Scroll the current page or document up or down, to the top or bottom",
     "volume": "Change the system sound volume: louder, quieter, mute, unmute, max",
     "media": "Control music or video playback: play, pause, resume, next track, previous track, skip",
     "screenshot": "Take a screenshot of the screen",
     "open_folder": "Open a folder like Downloads, Desktop, Documents, or the home folder in Finder",
     "system": "System-level action: lock the screen, put the display to sleep, show the desktop, toggle dark mode, empty the trash",
-    "task": "A multi-step task that needs looking at the screen and doing several things inside an app or website: fill in a form, find and click something specific, reply to a message, search a site and open a result, change a setting, compose and send an email (for example 'reply to the last email from Sam saying yes', 'find the cheapest flight to London on google flights', 'turn on dark mode in the settings app')",
-    "stop": "Tell the assistant to stop listening, go to sleep, or exit",
-    "none": "Not a command for the computer: conversation, thinking aloud, background chatter, or unintelligible",
+    "task": "A multi-step task that needs looking at the screen and doing several things inside an app or website: fill in a form, find and click something specific, reply to a message, search a site and open a result, change a setting, compose and send an email (for example 'reply to the last email from Sam saying yes', 'find the cheapest flight to London on google flights', 'turn on dark mode in the settings app'). Quitting or closing one application is close_app. Typing one value into a field, or clicking one control, is screen.",
+    "stop": "Tell the assistant to stop listening, go to sleep, or shut itself down (for example 'stop listening', 'goodbye'). Quitting another application is close_app.",
+    "none": "Not a command for the computer: conversation, thinking aloud, background chatter, or unintelligible. If `focused_field` is true, they are dictating into the open text area, so this is type_text, not conversation.",
 }
 
 SHORTCUT_CRITERIA: dict[str, str] = {
@@ -56,12 +60,12 @@ SHORTCUT_CRITERIA: dict[str, str] = {
     "new_tab": "open a new browser tab",
     "close_tab_or_window": "close the current tab or window",
     "reopen_closed_tab": "reopen the last closed tab",
-    "quit_app": "quit / exit the current application entirely",
+    "quit_app": "press command-q, the quit keyboard shortcut, in whatever is already focused",
     "minimize_window": "minimize the window",
     "hide_app": "hide the current app",
     "fullscreen": "toggle full screen",
-    "next_tab": "switch to the next tab",
-    "previous_tab": "switch to the previous tab",
+    "next_tab": "switch to the next tab, without naming which tab",
+    "previous_tab": "switch to the previous tab, without naming which tab",
     "browser_back": "go back to the previous page",
     "browser_forward": "go forward",
     "reload": "reload / refresh the page",
@@ -81,13 +85,19 @@ SHORTCUT_CRITERIA: dict[str, str] = {
 
 # regexes that peel the payload text off a spoken command
 _TEXT_PATTERNS = [
-    r"^(?:please\s+)?(?:can you\s+|could you\s+)?(?:type|write|enter|dictate|input|put|insert|say|send|text|paste)(?:\s+in|\s+out|\s+the\s+words?|\s+the\s+text|\s+this|\s+that)?[:,]?\s+(?P<t>.+)$",
+    r"^(?:please\s+)?(?:i\s+(?:want|need)\s+you\s+to\s+|i(?:'d|\s+would)\s+like\s+you\s+to\s+|can\s+you\s+|could\s+you\s+)?(?:type|write|enter|dictate|input|put|insert|say|send|text|paste)(?:\s+in|\s+out|\s+down|\s+the\s+words?|\s+the\s+text)?[:,]?\s+(?P<t>.+)$",
     r"^(?:please\s+)?(?:can you\s+|could you\s+)?(?:search|google|look\s*up|find|look\s+for|show\s+me|pull\s+up)(?:\s+(?:on|in)\s+\w+(?:\s+\w+)?)?(?:\s+for)?[:,]?\s+(?P<t>.+)$",
     r"^.*?\b(?:for|about|of|on)\s+(?P<t>.+)$",
     r"[\"“'](?P<t>[^\"”']+)[\"”']",
 ]
+_TRIVIAL = {"the", "a", "an", "to", "on", "in", "of", "for", "and", "it", "that", "this"}
 _TITLE = re.compile(r"\b(?:called|titled|named|labeled|that says|saying|with the title)\s+(?P<t>.+)$", re.I)
 _TRAILING_IN_APP = re.compile(r"\s+(?:in|into|inside|on)\s+(?:the\s+)?(?:[A-Z][\w.]*|notes|chrome|cursor|safari|slack|mail|messages|terminal|finder)(?:\s+app)?\s*[.!?]?$")
+# "write youtube.com on google chrome" → the payload is the span before the place.
+_TRAILING_PLACE = re.compile(
+    r"\s+(?:in|into|inside|on)\s+(?:the\s+)?[a-z0-9][\w.&'-]*(?:\s+[a-z0-9][\w.&'-]*){0,3}(?:\s+app)?\s*$",
+    re.I,
+)
 _TRAILING_SUBMIT = re.compile(
     r"[\s,.]*(?:and|then)?\s*(?:hit|press|and)\s+(?:enter|return|send|submit)\s*[.!]?$", re.I
 )
@@ -117,9 +127,13 @@ def text_candidates(utterance: str) -> dict[str, str]:
         if m:
             add(m.group("t"))
             add(_TRAILING_IN_APP.sub("", m.group("t")))
+            add(_TRAILING_PLACE.sub("", m.group("t")))
     whole = _clean(utterance)
     if whole and whole not in cands:
         cands.append(whole)
+    useful = [c for c in cands if c.casefold() not in _TRIVIAL]
+    if useful:
+        cands = useful
     if not cands:
         cands.append(utterance.strip() or "(nothing)")
     return {f"c{i}": c for i, c in enumerate(cands[:6])}
@@ -177,7 +191,12 @@ class Brain:
 
     # ------------------------------------------------------------ questions
 
-    def _questions(self, cands: dict[str, str], apps: list[str]) -> dict[str, Any]:
+    def _questions(self, cands: dict[str, str], apps: list[str], tabs: list | None = None, profiles: list | None = None) -> dict[str, Any]:
+        tab_criteria = {t.key: t.label for t in (tabs or [])}
+        tab_criteria["none"] = "No listed tab matches, or they want a new page rather than an open tab"
+        profile_criteria = {p.key: p.label for p in (profiles or [])}
+        profile_criteria["other"] = "Another profile, the other profile, or switch profile, with no profile name"
+        profile_criteria["none"] = "They did not ask to change profiles, or the browser has only one"
         q: dict[str, Any] = {
             "action": {
                 "type": "choice",
@@ -209,6 +228,21 @@ class Brain:
                 "instructions": "Assume the user wants to open or switch to an application. Which installed application in `apps` do they mean? Match on meaning: 'chrome' means Google Chrome, 'settings' means System Settings, 'browser' means the default browser. Choose `none` if no listed app matches.",
                 "criteria": {**{a: None for a in apps}, "none": "No listed application matches what the user said"},
             },
+            "close_target": {
+                "type": "choice",
+                "instructions": "Assume the user wants to quit or close an application entirely. Which installed application in `apps` do they mean? Match on meaning: 'chrome' means Google Chrome, 'notes' means Notes. Choose `frontmost` when they mean the current app, this app, or name no application. Choose `none` if no listed app matches. A tab or window is not an application.",
+                "criteria": {**{a: None for a in apps}, "frontmost": "The focused app, this app, or no specific application was named", "none": "No listed application matches what the user said"},
+            },
+            "tab_target": {
+                "type": "choice",
+                "instructions": "Assume the user wants to switch to a browser tab already open on this desktop. `tabs` lists those tabs. Choose the one they mean. 'the other tab' means the tab that is not marked current, when the list has one other tab. Choose `none` if no listed tab matches or they want a new page. A browser profile is not a tab.",
+                "criteria": tab_criteria,
+            },
+            "profile_target": {
+                "type": "choice",
+                "instructions": "Assume the user wants to change the browser's user profile. `profiles` lists profiles only for browsers that have more than one. Choose the profile they named. Choose `other` for another profile, the other profile, or switch profile with no name. Choose `none` when they did not ask to change profiles.",
+                "criteria": profile_criteria,
+            },
             "site": {
                 "type": "choice",
                 "instructions": "Assume the user wants to open a website. Which site do they mean? Choose `other` if it is not one of the listed sites.",
@@ -221,7 +255,7 @@ class Brain:
             },
             "text": {
                 "type": "choice",
-                "instructions": "Assume the user wants some text typed or searched. `candidates` holds possible payloads cut from the utterance. Which candidate is exactly the payload text the user intends, with no command words (like 'type', 'search for', 'on youtube') and no trailing 'and press enter' included?",
+                "instructions": "Assume the user wants some text typed or searched. `candidates` holds possible payloads cut from the utterance. Which candidate is exactly the text to insert, with no command words? 'I want you to write', 'write', and 'type' are the request, not part of the text. Do not include a trailing 'on youtube', 'in notes', or 'and press enter'. If a text area is already focused and they did not use those request words, the whole utterance is the text.",
                 "criteria": {k: v for k, v in cands.items()},
             },
             "in_app": {
@@ -285,23 +319,42 @@ class Brain:
     # ------------------------------------------------------------ inference
 
     def evaluate(self, utterance: str, front: str | None = None) -> Plan:
+        from .profiles import load_profiles
+        from .tabs import list_tabs
+
         apps = actions.installed_apps()
         cands = text_candidates(utterance)
+        try:
+            open_tabs = list_tabs()
+        except Exception:
+            open_tabs = []
+        try:
+            profiles = load_profiles()
+        except Exception:
+            profiles = []
+        try:
+            focused = actions.focused_text_field()
+        except Exception:
+            focused = False
         state = {
             "utterance": utterance,
             "frontmost_app": front if front is not None else actions.frontmost_app(),
             "apps": apps,
             "candidates": cands,
+            "tabs": [t.label for t in open_tabs],
+            "profiles": [p.label for p in profiles],
+            "focused_field": focused,
         }
-        payload = {"state": state, "model": self.model, "questions": self._questions(cands, apps)}
+        payload = {"state": state, "model": self.model, "questions": self._questions(cands, apps, open_tabs, profiles)}
         t0 = time.perf_counter()
         r = self.http.post(config.TYPESAFE_URL, json=payload)
         r.raise_for_status()
         data = r.json()
         ms = int((time.perf_counter() - t0) * 1000)
-        return self._to_plan(utterance, data["answers"], cands, ms)
+        return self._to_plan(utterance, data["answers"], cands, ms, open_tabs, profiles)
 
-    def _to_plan(self, utterance: str, ans: dict[str, Any], cands: dict[str, str], ms: int) -> Plan:
+    def _to_plan(self, utterance: str, ans: dict[str, Any], cands: dict[str, str], ms: int,
+                 tabs: list | None = None, profiles: list | None = None) -> Plan:
         act = ans["action"]
         action = act["choice"]
         conf = float(act["confidence"])
@@ -314,6 +367,29 @@ class Brain:
         if action == "open_app":
             app, c = ch("app")
             args["app"] = app
+            conf = min(conf, c)
+        elif action == "close_app":
+            app, c = ch("close_target")
+            args["app"] = app
+            conf = min(conf, c)
+        elif action == "switch_profile":
+            key, c = ch("profile_target")
+            args["profile"] = key
+            chosen = next((p for p in (profiles or []) if p.key == key), None)
+            if key == "other":
+                args["other"] = True
+            elif chosen is not None:
+                args["browser"] = chosen.browser
+                args["name"] = chosen.name
+                args["directory"] = chosen.directory
+            conf = min(conf, c)
+        elif action == "switch_tab":
+            key, c = ch("tab_target")
+            args["tab"] = key
+            chosen = next((t for t in (tabs or []) if t.key == key), None)
+            if chosen is not None:
+                args["browser"] = chosen.browser
+                args["title"] = chosen.title
             conf = min(conf, c)
         elif action == "open_website":
             site, c = ch("site")
@@ -371,7 +447,7 @@ class Brain:
             conf = min(conf, c)
 
         # "in the notes app": focus that app before acting inside it
-        if action in ("new_item", "shortcut", "type_text", "scroll") and float(ans["in_app"]["noul"]) > config.YES:
+        if action in ("new_item", "shortcut", "type_text", "scroll", "open_website", "web_search", "switch_tab", "switch_profile") and float(ans["in_app"]["noul"]) > config.YES:
             app, _ = ch("app")
             if app != "none":
                 args["in_app"] = app

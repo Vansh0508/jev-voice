@@ -24,9 +24,10 @@ TYPESAFE_API_KEY = os.environ.get("TYPESAFE_API_KEY", "")
 TYPESAFE_URL = os.environ.get("TYPESAFE_URL", "https://api.typesafe.ai/v1/systemone")
 JEV_MODEL = os.environ.get("JEV_MODEL", "jev-latest")
 
-WHISPER_MODEL = Path(os.environ.get("WHISPER_MODEL", ROOT / "models" / "ggml-base.en.bin"))
+WHISPER_MODEL = Path(os.environ.get("WHISPER_MODEL", ROOT / "models" / "ggml-small.en.bin"))
 WHISPER_PORT = int(os.environ.get("WHISPER_PORT", "8178"))
 WHISPER_THREADS = int(os.environ.get("WHISPER_THREADS", "6"))
+WHISPER_BEAM = int(os.environ.get("WHISPER_BEAM", "5"))
 
 SAMPLE_RATE = 16000
 TTS_VOICE = os.environ.get("TTS_VOICE", "Samantha")

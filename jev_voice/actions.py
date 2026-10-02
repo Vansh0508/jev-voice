@@ -9,6 +9,9 @@ from functools import lru_cache
 from pathlib import Path
 from urllib.parse import quote_plus
 
+from .profiles import switch_profile
+from .tabs import TAB_SHORTCUTS, focus_browser_on_this_desktop, is_browser, new_tab_on_this_desktop, switch_tab
+
 # ---------------------------------------------------------------- apps
 
 APP_DIRS = [
@@ -71,8 +74,65 @@ def frontmost_app() -> str:
         return ""
 
 
+_TEXT_ROLES = {"AXTextField", "AXTextArea", "AXComboBox", "AXSearchField"}
+
+
+def focused_text_field() -> bool:
+    """True when the focused control is a text area, so speech is dictation into it."""
+    try:
+        import ApplicationServices as AS  # type: ignore
+    except Exception:
+        return False
+    if not AS.AXIsProcessTrusted():
+        return False
+    pid = frontmost_pid()
+    if pid:
+        app = AS.AXUIElementCreateApplication(pid)
+        for attr in ("AXManualAccessibility", "AXEnhancedUserInterface"):
+            try:
+                AS.AXUIElementSetAttributeValue(app, attr, True)
+            except Exception:
+                pass
+    err, el = AS.AXUIElementCopyAttributeValue(AS.AXUIElementCreateSystemWide(), "AXFocusedUIElement", None)
+    if err != 0 or el is None:
+        return False
+    for _ in range(6):
+        err, role = AS.AXUIElementCopyAttributeValue(el, "AXRole", None)
+        if err == 0 and str(role or "") in _TEXT_ROLES:
+            return True
+        err, el = AS.AXUIElementCopyAttributeValue(el, "AXParent", None)
+        if err != 0 or el is None:
+            return False
+    return False
+
+
 def open_app(name: str) -> None:
     subprocess.Popen(["open", "-a", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def quit_app(name: str) -> str:
+    """Quit a running app by its installed name. ``frontmost`` quits the focused app.
+
+    Returns ``quit``, ``missing`` (not running), ``none`` (no app named), or ``failed``.
+    """
+    try:
+        from AppKit import NSApplicationActivationPolicyRegular, NSWorkspace  # type: ignore
+    except Exception:
+        return "failed"
+    if name == "frontmost":
+        name = frontmost_app()
+    if not name or name == "none":
+        return "none"
+    running = [
+        app for app in NSWorkspace.sharedWorkspace().runningApplications()
+        if app.activationPolicy() == NSApplicationActivationPolicyRegular
+        and str(app.localizedName() or "").lower() == name.lower()
+    ]
+    if not running:
+        return "missing"
+    if any(bool(app.terminate()) for app in running):
+        return "quit"
+    return "failed"
 
 
 def _activate(name: str) -> bool:
@@ -126,10 +186,13 @@ def focus_app(name: str, timeout: float = 2.0) -> bool:
     return False
 
 
-def open_url(url: str) -> None:
+def open_url(url: str, browser: str | None = None) -> str | None:
+    """Open a URL in a browser window on this desktop. None means the tab was opened."""
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
-    subprocess.Popen(["open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    from .tabs import open_on_this_desktop
+
+    return open_on_this_desktop(url, browser if is_browser(browser) else None)
 
 
 # ---------------------------------------------------------------- sites / search
@@ -176,9 +239,9 @@ SEARCH_ENGINES: dict[str, str] = {
 }
 
 
-def web_search(engine: str, query: str) -> None:
+def web_search(engine: str, query: str, browser: str | None = None) -> str | None:
     tpl = SEARCH_ENGINES.get(engine, SEARCH_ENGINES["google"])
-    open_url(tpl.format(q=quote_plus(query)))
+    return open_url(tpl.format(q=quote_plus(query)), browser)
 
 
 # ---------------------------------------------------------------- keyboard
@@ -190,10 +253,66 @@ def _osascript(script: str) -> str:
     return out.stdout.strip()
 
 
+# macOS virtual-key codes already used by the shortcut table, named for PyAutoGUI.
+_GUI_CODE = {
+    "code:36": "enter",
+    "code:53": "esc",
+    "code:48": "tab",
+    "code:49": "space",
+    "code:51": "backspace",
+    "code:117": "delete",
+    "code:126": "up",
+    "code:125": "down",
+    "code:123": "left",
+    "code:124": "right",
+    "code:103": "f11",
+}
+_GUI_MODS = {"command": "command", "shift": "shift", "control": "ctrl", "option": "option"}
+
+
+def _gui():
+    """PyAutoGUI posts the same Quartz events as the rest of the executor. Pause is off so a
+    typed word is not slowed by the library's default tenth-of-a-second gap."""
+    import pyautogui
+
+    pyautogui.PAUSE = 0
+    pyautogui.FAILSAFE = True
+    return pyautogui
+
+
+def _gui_can_type(text: str) -> bool:
+    mapping = _gui().platformModule.keyboardMapping
+    return all(ch in mapping or (ch.lower() in mapping and ch.isupper()) for ch in text)
+
+
+def _type_quartz(text: str) -> None:
+    """Characters PyAutoGUI has no key for (emoji, accents) go out as Unicode key events."""
+    import Quartz  # type: ignore
+
+    for line_no, line in enumerate(text.split("\n")):
+        if line_no:
+            for down in (True, False):
+                Quartz.CGEventPost(Quartz.kCGHIDEventTap, Quartz.CGEventCreateKeyboardEvent(None, 36, down))
+            time.sleep(0.01)
+        for i in range(0, len(line), 20):
+            part = line[i:i + 20]
+            for down in (True, False):
+                ev = Quartz.CGEventCreateKeyboardEvent(None, 0, down)
+                Quartz.CGEventKeyboardSetUnicodeString(ev, len(part), part)
+                Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
+            time.sleep(0.008)
+
+
 def type_text(text: str) -> None:
-    # System Events keystroke handles Unicode; escape for AppleScript string literal.
-    esc = text.replace("\\", "\\\\").replace('"', '\\"')
-    _osascript(f'tell application "System Events" to keystroke "{esc}"')
+    if text and _gui_can_type(text):
+        _gui().write(text, interval=0)
+        return
+    _type_quartz(text)
+
+
+def click_at(x: float, y: float) -> None:
+    """Click a point the accessibility tree already resolved. PyAutoGUI does not pick the point."""
+    _gui().click(x, y)
 
 
 # name -> (key or key code, modifiers)
@@ -252,15 +371,14 @@ SHORTCUTS: dict[str, tuple[str, list[str]]] = {
 
 def press(shortcut: str, times: int = 1) -> None:
     key, mods = SHORTCUTS[shortcut]
-    using = ""
-    if mods:
-        using = " using {" + ", ".join(f"{m} down" for m in mods) + "}"
-    if key.startswith("code:"):
-        cmd = f"key code {key[5:]}{using}"
-    else:
-        cmd = f'keystroke "{key}"{using}'
-    body = "\n".join([cmd] * max(1, times))
-    _osascript(f'tell application "System Events"\n{body}\nend tell')
+    name = _GUI_CODE.get(key, key)
+    gui_mods = [_GUI_MODS.get(m, m) for m in mods]
+    gui = _gui()
+    for _ in range(max(1, times)):
+        if gui_mods:
+            gui.hotkey(*gui_mods, name)
+        else:
+            gui.press(name)
 
 
 # ---------------------------------------------------------------- scroll

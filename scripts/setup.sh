@@ -11,8 +11,8 @@ command -v uv >/dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
 
 echo "▸ Whisper model"
 mkdir -p models
-[ -f models/ggml-base.en.bin ] || curl -L -o models/ggml-base.en.bin \
-  https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin
+[ -f models/ggml-small.en.bin ] || curl -L -o models/ggml-small.en.bin \
+  https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.en.bin
 
 echo "▸ Python env"
 uv sync -q

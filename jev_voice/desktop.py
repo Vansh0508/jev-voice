@@ -417,7 +417,7 @@ def display_bounds(which: str | None) -> tuple[float, float, float, float] | Non
 class Desktop:
     def __init__(self, apps: list[str] | None = None, display: str | None = None) -> None:
         if not AS.AXIsProcessTrusted():
-            raise SystemExit("Accessibility permission missing: System Settings → Privacy & Security → Accessibility → add your terminal.")
+            raise RuntimeError("Accessibility permission missing: System Settings → Privacy & Security → Accessibility → add your terminal.")
         self.system = AS.AXUIElementCreateSystemWide()
         # Everything observed and touched stays on this monitor; windows are moved onto it first.
         self.display = display_bounds(display if display is not None else os.environ.get("AGENT_DISPLAY"))
@@ -747,14 +747,7 @@ class Desktop:
 
     @staticmethod
     def _click(x: float, y: float) -> None:
-        move = Quartz.CGEventCreateMouseEvent(None, Quartz.kCGEventMouseMoved, (x, y), Quartz.kCGMouseButtonLeft)
-        Quartz.CGEventPost(Quartz.kCGHIDEventTap, move)
-        time.sleep(0.01)
-        for t in (Quartz.kCGEventLeftMouseDown, Quartz.kCGEventLeftMouseUp):
-            ev = Quartz.CGEventCreateMouseEvent(None, t, (x, y), Quartz.kCGMouseButtonLeft)
-            Quartz.CGEventSetIntegerValueField(ev, Quartz.kCGMouseEventClickState, 1)
-            Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
-            time.sleep(0.01)
+        actions.click_at(x, y)
 
     @staticmethod
     def _chord(keycode: int, flags: int) -> None:
@@ -766,18 +759,8 @@ class Desktop:
 
     @staticmethod
     def type_unicode(text: str, chunk: int = 20) -> None:
-        for line_no, line in enumerate(text.split("\n")):
-            if line_no:
-                for down in (True, False):
-                    Quartz.CGEventPost(Quartz.kCGHIDEventTap, Quartz.CGEventCreateKeyboardEvent(None, 36, down))
-                time.sleep(0.01)
-            for i in range(0, len(line), chunk):
-                part = line[i:i + chunk]
-                for down in (True, False):
-                    ev = Quartz.CGEventCreateKeyboardEvent(None, 0, down)
-                    Quartz.CGEventKeyboardSetUnicodeString(ev, len(part), part)
-                    Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
-                time.sleep(0.008)
+        del chunk
+        actions.type_text(text)
 
     def view(self) -> dict[str, float]:
         """The rectangle the inspector shows: the confined display, else the main display."""

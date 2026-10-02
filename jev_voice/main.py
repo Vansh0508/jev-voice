@@ -25,9 +25,11 @@ from . import actions, config
 from .brain import Brain, Plan, split_compound
 from .overlay import NullOverlay
 from .persona import flavor
+from .pipeline import Command, CommandQueue, Executor, Speculator, StatusFeed
+from .stt import LiveTranscriber
 from .tts import Speaker
 
-OVERLAY = NullOverlay()  # replaced with a real Overlay in run_voice unless --no-overlay
+OVERLAY = StatusFeed(NullOverlay())  # wraps a real Overlay in run_voice unless --no-overlay
 
 SOUND_START = "/System/Library/Sounds/Tink.aiff"
 SOUND_STOP = "/System/Library/Sounds/Pop.aiff"
@@ -38,7 +40,12 @@ FEEDBACK = os.environ.get("FEEDBACK", "ding")
 IDLE_LABEL = "Listening"
 
 
+_DING_HOOK = None  # set by Session so the open mic does not transcribe the chime
+
+
 def ding(path: str) -> None:
+    if _DING_HOOK:
+        _DING_HOOK()
     subprocess.Popen(["afplay", "-v", "0.4", path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
@@ -52,10 +59,11 @@ SELLER_MESSAGE = os.environ.get("SELLER_MESSAGE", "Hi! Is this still available?"
 
 
 def run_task(goal: str, speaker: Speaker | None = None, start_url: str | None = None, recommend: bool = False,
-             message: str | None = None) -> str:
+             message: str | None = None, driver: str | None = None) -> str:
     """Multi-step goal: the jev-ultrafast loop. TASK_DRIVER=browser (default) drives Chrome over
     CDP exactly as jev-ultrafast does; TASK_DRIVER=desktop uses the experimental AX-tree port.
-    One Jev request per step; the executor only ever touches observed controls."""
+    ``driver`` overrides that for one run. One Jev request per step; the executor only ever
+    touches observed controls."""
     global _DESKTOP
     from .agent import describe_step
 
@@ -69,7 +77,8 @@ def run_task(goal: str, speaker: Speaker | None = None, start_url: str | None = 
         print(f"  ▶ {line}")
         OVERLAY.set("thinking", f"{step['step']}. {line}")
 
-    if TASK_DRIVER == "browser":
+    which = driver or TASK_DRIVER
+    if which == "browser":
         from .web import WebAgent
 
         agent_cm = WebAgent(goal, url=start_url, display=os.environ.get("AGENT_DISPLAY") or None, on_step=show)
@@ -91,7 +100,7 @@ def run_task(goal: str, speaker: Speaker | None = None, start_url: str | None = 
         from .costs import run_costs, usd
 
         reply = "Done." if st["status"] == "done" else "I couldn't finish that."
-        if recommend and TASK_DRIVER == "browser" and st["status"] == "done":
+        if recommend and which == "browser" and st["status"] == "done":
             try:
                 rec = agent.recommend()
                 OVERLAY.set("done", f"★ {rec['summary']}", revert_after=8.0)
@@ -125,9 +134,25 @@ def execute(plan: Plan, dry: bool = False, speaker: Speaker | None = None) -> st
         return run_task(plan.utterance, speaker, start_url=actions.SITES.get(site) if site else None,
                         recommend=bool(a.get("recommend")) or bool(a.get("message_seller")),
                         message=SELLER_MESSAGE if a.get("message_seller") else None)
-    if a.get("in_app"):
+    if act == "screen":
+        # Type into a field, or click a control, in whatever app was named. The accessibility
+        # tree is the observation; Chrome-over-CDP cannot see Photo Booth or a native text field.
+        return run_task(plan.utterance, speaker, driver="desktop")
+    tabby = (act == "new_item" and a.get("kind") == "tab") or (act == "shortcut" and a.get("shortcut") in actions.TAB_SHORTCUTS)
+    browser_act = act in ("open_website", "web_search", "switch_tab", "switch_profile") or tabby
+    if a.get("in_app") and not (browser_act and actions.is_browser(a["in_app"])):
         if not actions.focus_app(a["in_app"]):
             return f"I couldn't bring up {a['in_app']}."
+    if act == "switch_profile":
+        if a.get("profile") in (None, "none"):
+            return "I don't see another profile."
+        return actions.switch_profile(a.get("in_app") or a.get("browser"), a.get("directory"), a.get("name"), bool(a.get("other")))
+    if act == "switch_tab":
+        if not a.get("title"):
+            return "I don't see that tab."
+        return actions.switch_tab(a["browser"], a["title"])
+    if act == "new_item" and a.get("kind") == "tab":
+        return actions.new_tab_on_this_desktop(a.get("in_app")) or "Done."
     if act == "new_item":
         actions.press({"tab": "new_tab", "window": "new"}.get(a.get("kind", "item"), "new"))
         title = a.get("title")
@@ -141,18 +166,37 @@ def execute(plan: Plan, dry: bool = False, speaker: Speaker | None = None) -> st
             return "I don't see that app."
         actions.open_app(a["app"])
         return f"Opening {a['app']}."
+    if act == "close_app":
+        target = a.get("app", "none")
+        if target == "none":
+            return "I don't see that app."
+        name = actions.frontmost_app() if target == "frontmost" else target
+        if not name:
+            return "I don't see an app to close."
+        result = actions.quit_app(target)
+        if result == "missing":
+            return f"{name} isn't open."
+        if result != "quit":
+            return f"I couldn't close {name}."
+        return f"Closing {name}."
     if act == "open_website":
-        actions.open_url(a["url"])
-        return f"Opening {a['site'].replace('_', ' ')}."
+        err = actions.open_url(a["url"], browser=a.get("in_app"))
+        return err or f"Opening {a['site'].replace('_', ' ')}."
     if act == "web_search":
-        actions.web_search(a["engine"], a["query"])
-        return f"Searching {a['engine'].replace('_', ' ')} for {a['query']}."
+        err = actions.web_search(a["engine"], a["query"], browser=a.get("in_app"))
+        return err or f"Searching {a['engine'].replace('_', ' ')} for {a['query']}."
     if act == "type_text":
         actions.type_text(a["text"])
         if a["submit"]:
             actions.press("enter")
         return "Done."
     if act == "shortcut":
+        if a.get("shortcut") == "new_tab":
+            return actions.new_tab_on_this_desktop(a.get("in_app")) or "Done."
+        if a.get("shortcut") in actions.TAB_SHORTCUTS:
+            err = actions.focus_browser_on_this_desktop(a.get("in_app"))
+            if err:
+                return err
         actions.press(a["shortcut"])
         return a["shortcut"].replace("_", " ").capitalize() + "."
     if act == "scroll":
@@ -190,16 +234,23 @@ def handle(brain: Brain, speaker: Speaker, utterance: str, dry: bool, depth: int
             return True
     try:
         reply = execute(plan, dry, speaker)
+    except SystemExit as e:
+        # Desktop used to abort the process when Accessibility was missing. A voice
+        # session must stay up and say why.
+        msg = e.code if isinstance(e.code, str) else str(e)
+        print(f"  ! {msg}")
+        reply = "I couldn't do that without Accessibility permission." if "Accessibility" in msg else "That failed."
     except Exception as e:  # noqa: BLE001
-        reply = "That failed."
-        print(f"  ! {e}")
+        msg = str(e)
+        print(f"  ! {msg}")
+        reply = "I couldn't do that without Accessibility permission." if "Accessibility" in msg else "That failed."
     if reply == "__stop__":
         if FEEDBACK == "voice":
             speaker.say(flavor("Bye."))
         else:
             ding(SOUND_STOP)
         return False
-    failed = reply in ("That failed.", "Not sure what you meant.", "I don't see that app.") or reply.startswith("I couldn't")
+    failed = reply in ("That failed.", "Not sure what you meant.") or reply.startswith("I couldn't") or reply.startswith("I don't see") or reply.startswith("I need permission") or reply.endswith("isn't open.") or reply.endswith("isn't on this desktop.") or reply.endswith("one profile.") or reply.endswith("that profile.")
     if plan.action == "task" and plan.confidence >= config.ACTION_MIN_CONFIDENCE and not dry:
         OVERLAY.set("error" if failed else "done", f"Task: {utterance}  ·  {reply}", revert_after=3.0)
     if reply:
@@ -228,9 +279,13 @@ def describe(plan: Plan) -> str:
     act = plan.action
     return {
         "open_app": lambda: f"Open {a.get('app')}",
+        "close_app": lambda: f"Close {a.get('app')}",
+        "switch_profile": lambda: f"Profile {a.get('name') or 'other'}",
+        "switch_tab": lambda: f"Switch to {a.get('title', 'tab')}",
         "open_website": lambda: f"Open {a.get('site', '').replace('_', ' ')}",
         "web_search": lambda: f"Search {a.get('engine', '').replace('_', ' ')}: {a.get('query')}",
         "type_text": lambda: f"Type “{a.get('text')}”" + (" ⏎" if a.get('submit') else ""),
+        "screen": lambda: f"On screen: {plan.utterance}",
         "new_item": lambda: f"New {a.get('kind', 'item')}" + (f" “{a['title']}”" if a.get('title') else ""),
         "shortcut": lambda: a.get("shortcut", "").replace("_", " ").capitalize(),
         "scroll": lambda: f"Scroll {a.get('direction')} ({a.get('amount')})",
@@ -273,37 +328,183 @@ class Session:
         self.brain = Brain()
         self.speaker = Speaker(enabled=not args.quiet)
         self.listener = Listener(device=args.device)
+        self.listener.mute_when = self.speaker.speaking
+        self.listener.on_speech_start = self._speech_started
+        self.listener.on_speech_abort = lambda: OVERLAY.voice(False)
         self.listener.start()
+        self.paused = False
+        self._streamed = False
+        self.queue = CommandQueue()
+        self.executor = Executor(self.queue, self._run, on_stop=self.listener.interrupt)
+        self.spec = Speculator(self.brain.evaluate, actions.frontmost_app, self.executor)
+        self.spec.prepare = self._prepare
+        global _DING_HOOK
+        _DING_HOOK = self._mute_chime
+        OVERLAY.pending = self.queue.pending
+        self.executor.start()
 
     def close(self) -> None:
         self.listener.stop()
         self.stt.stop()
 
-    def process(self, pcm: np.ndarray) -> bool:
-        """Transcribe + plan + execute. Returns False on 'stop'."""
+    def stopped(self) -> bool:
+        return self.executor.stopped.is_set()
+
+    def _mute_chime(self) -> None:
+        self.listener.pause(0.4)
+
+    def _speech_started(self) -> None:
+        OVERLAY.voice(True)
+        OVERLAY.set("listening", "Deactivated" if self.paused else "Listening…")
+
+    def _prepare(self, text: str) -> str | None:
+        """The command a partial transcript would become, or None if it would not be run."""
+        if self.paused:
+            return None
+        action, rest = apply_listen_gate(text, False)
+        if action != "pass" or _CANCEL_RE.match(rest):
+            return None
+        return rest
+
+    def _show_partial(self, text: str) -> None:
+        self._streamed = True
+        print(f"\r   … {text}", end="", flush=True)
+        OVERLAY.set("heard", text)
+        self.spec.offer(text)
+
+    def capture(self) -> tuple[np.ndarray, str, int]:
+        """Listen to one utterance, publishing the transcript as whisper catches up."""
+        self.spec.reset()
+        live = LiveTranscriber(self.stt, self._show_partial)
+        try:
+            pcm = self.listener.next_utterance(on_partial=live.push)
+        except BaseException:
+            live.cancel()
+            OVERLAY.voice(False)
+            raise
+        if not pcm.size:
+            live.cancel()
+            OVERLAY.voice(False)
+            return pcm, "", 0
+        t0 = time.perf_counter()
+        text = live.finish(pcm)
+        if self._streamed:
+            print()
+            self._streamed = False
+        OVERLAY.voice(False)
+        return pcm, text, int((time.perf_counter() - t0) * 1000)
+
+    def _run(self, cmd: Command) -> bool:
+        """Executor thread: plan (reusing the early plan when it is still valid), then act."""
+        plan = self.spec.take(cmd.text) if cmd.speculate else None
+        early = plan is not None
+        if cmd.needs_gate:
+            gate = plan or self.brain.evaluate(cmd.text)
+            ok_cmd = (gate.args.get("addressed", 0) >= UNNAMED_MIN_ADDRESSED
+                      and gate.confidence >= UNNAMED_MIN_CONFIDENCE)
+            if not ok_cmd or gate.action == "none":
+                print(f"   ·  {cmd.text}   (ignored: addressed={gate.args.get('addressed')} {gate.action} conf={gate.confidence:.2f})")
+                OVERLAY.set("idle", f"Ignored: {cmd.text}", revert_after=2.5)
+                return True
+            if cmd.on_accept:
+                cmd.on_accept()
+            plan = gate
+        if early:
+            print("  ⚡ planned while you spoke")
+        return handle(self.brain, self.speaker, cmd.text, self.args.dry_run, plan=plan)
+
+    def enqueue(self, cmd: Command, pcm: np.ndarray, stt_ms: int) -> None:
+        ahead = self.queue.pending() + (1 if self.executor.busy else 0)
+        note = f", queued behind {ahead}" if ahead else ""
+        print(f"🗣  {cmd.text}   ({len(pcm)/config.SAMPLE_RATE:.1f}s audio, stt {stt_ms}ms{note})")
+        self.queue.put(cmd)
+        if ahead:
+            OVERLAY.set("heard", f"Queued: {cmd.text}", revert_after=1.5)
+
+    def submit(self, pcm: np.ndarray, text: str | None = None, stt_ms: int = 0) -> bool:
+        """Gate one utterance and queue it. Returns False once the assistant has stopped."""
+        if self.stopped():
+            return False
         if len(pcm) < config.SAMPLE_RATE * 0.25:
             return True
-        t0 = time.perf_counter()
-        text = self.stt.transcribe(pcm)
-        stt_ms = int((time.perf_counter() - t0) * 1000)
+        if text is None:
+            t0 = time.perf_counter()
+            text = self.stt.transcribe(pcm)
+            stt_ms = int((time.perf_counter() - t0) * 1000)
         if not text:
             print("  (heard nothing)")
             return True
-        print(f"🗣  {text}   ({len(pcm)/config.SAMPLE_RATE:.1f}s audio, stt {stt_ms}ms)")
-        self.listener.pause(0.3)
-        ok = handle(self.brain, self.speaker, text, self.args.dry_run)
-        if self.speaker.speaking():
-            self.listener.pause(0.9)
-        self.listener.drain()
-        return ok
+        action, rest = apply_listen_gate(text, self.paused)
+        if action == "pause":
+            _ack_pause(self)
+            return True
+        if action == "ignore":
+            print(f"   ·  {text}   (paused)")
+            return True
+        if action == "resume":
+            _ack_resume(self)
+            if not rest:
+                return True
+            text = rest
+        if cancel_queued(self, text):
+            return True
+        self.enqueue(Command(text), pcm, stt_ms)
+        return True
 
 
 # ------------------------------------------------------------------ wake word
 
 WAKE_WORDS = [w.strip().lower() for w in os.environ.get("WAKE_WORDS", "alfred,jarvis,alfie,alford,elfred").split(",") if w.strip()]
+for _extra in ("jev", "jeff"):
+    if _extra not in WAKE_WORDS:
+        WAKE_WORDS.append(_extra)
 FOLLOWUP_SECONDS = float(os.environ.get("FOLLOWUP_SECONDS", "8"))
 _WAKE_RE = re.compile(r"^\W*(?:hey|hi|ok|okay|yo)?\W*(?P<w>" + "|".join(map(re.escape, WAKE_WORDS)) + r")\b\W*", re.I)
 _WAKE_ANY = re.compile(r"\W*\b(?:" + "|".join(map(re.escape, WAKE_WORDS)) + r")\b\W*", re.I)
+# "hey Jeff" is how the name is spoken. "Deactivate" drops every command until reactivate or hey Jeff.
+_JEFF = r"(?:jev|jeff)"
+_PAUSE_RE = re.compile(
+    rf"^(?:(?:hey|hi)[\s,]+)?(?:please[\s,]+)?(?:{_JEFF}[\s,]+)?(?:deactivate|de-activate|de activate)(?:[\s,]+{_JEFF})?[.!?]*$",
+    re.I,
+)
+_RESUME_EXACT = re.compile(
+    rf"^(?:(?:hey|hi)[\s,]+)?(?:please[\s,]+)?(?:reactivate|re-activate|re activate)(?:[\s,]+{_JEFF})?[.!?]*$",
+    re.I,
+)
+_HEY_JEFF = re.compile(
+    rf"^(?:(?:hey|hi|ok|okay)[\s,]+)?{_JEFF}\b[\s,.:;-]*(?P<cmd>.*)$",
+    re.I,
+)
+
+
+_CANCEL_RE = re.compile(
+    rf"^(?:(?:hey|hi|ok|okay)[\s,]+)?(?:{_JEFF}[\s,]+)?(?:please[\s,]+)?"
+    r"(?:cancel(?:\s+(?:that|it|all|everything))?|never\s*mind|stop(?:\s+(?:that|it))?)[.!?]*$",
+    re.I,
+)
+_BARE_STOP = re.compile(rf"^(?:(?:hey|hi|ok|okay)[\s,]+)?(?:{_JEFF}[\s,]+)?stop[.!?]*$", re.I)
+
+
+def cancel_queued(s: "Session", text: str) -> bool:
+    """Cancel drops commands that have not started; the running one finishes.
+    With nothing queued, a bare "stop" still reaches Jev (it shuts the assistant down)."""
+    if not _CANCEL_RE.match(text.strip()):
+        return False
+    running = s.executor.busy
+    n = s.queue.clear()
+    if not n and not running:
+        if _BARE_STOP.match(text.strip()):
+            return False
+        print(f"   ·  {text}   (nothing to cancel)")
+        return True
+    msg = f"Cleared {n} queued" if n else "Nothing queued"
+    print(f"✋ {msg}" + ("; finishing the current action." if running else "."))
+    OVERLAY.set("idle", msg, revert_after=1.5)
+    if FEEDBACK == "voice":
+        s.speaker.say(flavor("Cancelled."))
+    else:
+        ding(SOUND_STOP)
+    return True
 
 
 UNNAMED_COMMANDS = os.environ.get("UNNAMED_COMMANDS", "1") not in ("0", "false", "no")
@@ -340,6 +541,46 @@ def strip_wake(text: str) -> tuple[bool, str]:
     return False, text
 
 
+def apply_listen_gate(text: str, paused: bool) -> tuple[str, str]:
+    """Deactivate ignores every utterance except hey Jeff and reactivate.
+
+    Returns pause, ignore, resume, or pass. The second value is a command that
+    followed hey Jeff, if there was one.
+    """
+    cleaned = text.strip()
+    if not paused and _PAUSE_RE.match(cleaned):
+        return "pause", ""
+    if paused:
+        if _RESUME_EXACT.match(cleaned):
+            return "resume", ""
+        heard = _HEY_JEFF.match(cleaned)
+        if heard:
+            return "resume", heard.group("cmd").strip(" ,.")
+        return "ignore", ""
+    return "pass", cleaned
+
+
+def _ack_pause(s: "Session") -> None:
+    s.paused = True
+    dropped = s.queue.clear() if hasattr(s, "queue") else 0
+    print("⏸  Deactivated. Say \"hey Jeff\" or \"reactivate\"." + (f" (cleared {dropped} queued)" if dropped else ""))
+    OVERLAY.set("idle", "Deactivated")
+    if FEEDBACK == "voice":
+        s.speaker.say(flavor("Deactivated."))
+    else:
+        ding(SOUND_STOP)
+
+
+def _ack_resume(s: "Session") -> None:
+    s.paused = False
+    print("▶  Listening.")
+    OVERLAY.set("listening", "Listening")
+    if FEEDBACK == "voice":
+        s.speaker.say(flavor("Listening."))
+    else:
+        ding(SOUND_START)
+
+
 # ------------------------------------------------------------------ modes
 
 def run_smart(s: Session) -> None:
@@ -357,65 +598,74 @@ def run_smart(s: Session) -> None:
         ding(SOUND_START)
         arm(10.0)
 
-    if not capslock_remapped():
+    # Caps Lock stays a normal key unless CAPSLOCK_TALK=1; the wake word does not need it.
+    caps_talk = os.environ.get("CAPSLOCK_TALK", "0") in ("1", "true", "yes")
+    if caps_talk and not capslock_remapped():
         remap_capslock()
-    tap = CapsLockListener(on_press, lambda: None)
-    caps = tap.start()
-    names = ", ".join(w.capitalize() for w in WAKE_WORDS[:2])
-    print(f"🎙  Hands-free. Say \"{names.split(', ')[0]}, open chrome\"."
-          + (" Or tap CAPS LOCK then speak." if caps else " (Caps Lock tap unavailable: no Accessibility/Input Monitoring.)")
-          + f"  (Jev {s.brain.model}, whisper base.en, voice {s.speaker.engine}:{s.speaker.voice})")
+    caps = CapsLockListener(on_press, lambda: None).start() if caps_talk else False
+    print("🎙  Hands-free. Say \"hey Jeff\" to wake me. \"Deactivate\" stops listening until \"reactivate\"."
+          + ((" Or tap CAPS LOCK then speak." if caps else " (Caps Lock tap unavailable: no Accessibility/Input Monitoring.)") if caps_talk else "")
+          + f"  (Jev {s.brain.model}, whisper {config.WHISPER_MODEL.stem.removeprefix("ggml-")}, voice {s.speaker.engine}:{s.speaker.voice})")
     if FEEDBACK == "voice":
         s.speaker.say(flavor("Ready."))
     else:
         ding(SOUND_DONE)
     s.listener.pause(0.8)
-    s.listener.on_speech_start = lambda: OVERLAY.set("listening", "Listening…")
-    while True:
-        pcm = s.listener.next_utterance()
-        OVERLAY.set("heard", "Transcribing…")
-        t0 = time.perf_counter()
-        text = s.stt.transcribe(pcm)
-        stt_ms = int((time.perf_counter() - t0) * 1000)
+
+    def prepare(text: str) -> str | None:
+        cmd = s._prepare(text)
+        if not cmd:
+            return None
+        addressed, rest = strip_wake(cmd)
+        if addressed:
+            return rest or None
+        return cmd if UNNAMED_COMMANDS or time.monotonic() < armed["until"] else None
+
+    s.spec.prepare = prepare
+    while not s.stopped():
+        pcm, text, stt_ms = s.capture()
+        if s.stopped():
+            break
         if not text:
-            OVERLAY.set("idle", IDLE_LABEL, revert_after=0.1)
+            OVERLAY.set("idle", "Deactivated" if s.paused else IDLE_LABEL, revert_after=0.1)
             continue
+        action, rest = apply_listen_gate(text, s.paused)
+        if action == "pause":
+            armed["until"] = 0
+            _ack_pause(s)
+            continue
+        if action == "ignore":
+            print(f"   ·  {text}   (paused, stt {stt_ms}ms)")
+            OVERLAY.set("idle", "Deactivated", revert_after=1.5)
+            continue
+        forced = False
+        if action == "resume":
+            _ack_resume(s)
+            if not rest:
+                arm(FOLLOWUP_SECONDS)
+                continue
+            addressed, cmd = True, rest
+            forced = True
+        else:
+            addressed, cmd = strip_wake(text)
         OVERLAY.set("heard", text)
-        addressed, cmd = strip_wake(text)
-        if not addressed and time.monotonic() < armed["until"]:
+        if not forced and not addressed and time.monotonic() < armed["until"]:
             addressed, cmd = True, text
         if not cmd and addressed:        # just the name: acknowledge and wait for the command
             ding(SOUND_START)
             arm(FOLLOWUP_SECONDS)
             continue
-        gate = None
-        if not addressed:
-            if not UNNAMED_COMMANDS:
-                print(f"   ·  {text}   (ignored: no name, stt {stt_ms}ms)")
-                OVERLAY.set("idle", f"Ignored: {text}", revert_after=2.5)
-                continue
-            # No name: let Jev judge whether this is a command for the computer at all.
-            gate = s.brain.evaluate(text)
-            ok_cmd = (gate.args.get("addressed", 0) >= UNNAMED_MIN_ADDRESSED
-                      and gate.confidence >= UNNAMED_MIN_CONFIDENCE)
-            if ok_cmd and gate.action == "none":
-                print(f"   ·  {text}   (Jev: none, addressed={gate.args.get('addressed')} conf={gate.confidence:.2f}, stt {stt_ms}ms)")
-                continue
-            if not ok_cmd:
-                print(f"   ·  {text}   (ignored: addressed={gate.args.get('addressed')} {gate.action} conf={gate.confidence:.2f}, stt {stt_ms}ms)")
-                OVERLAY.set("idle", f"Ignored: {text}", revert_after=2.5)
-                continue
-            cmd = text
-        tag = f", addressed={gate.args.get('addressed')}" if gate else ""
-        print(f"🗣  {cmd}   ({len(pcm)/config.SAMPLE_RATE:.1f}s audio, stt {stt_ms}ms{tag})")
-        s.listener.pause(0.3)
-        ok = handle(s.brain, s.speaker, cmd, s.args.dry_run, plan=gate)
-        if s.speaker.speaking():
-            s.listener.pause(0.9)
-        s.listener.drain()
-        arm(FOLLOWUP_SECONDS)
-        if not ok:
-            break
+        if cancel_queued(s, cmd if addressed else text):
+            continue
+        if not addressed and not UNNAMED_COMMANDS:
+            print(f"   ·  {text}   (ignored: no name, stt {stt_ms}ms)")
+            OVERLAY.set("idle", f"Ignored: {text}", revert_after=2.5)
+            continue
+        # No name: the executor asks Jev whether it was meant for the computer, off this thread.
+        s.enqueue(Command(cmd if addressed else text, needs_gate=not addressed,
+                          on_accept=lambda: arm(FOLLOWUP_SECONDS)), pcm, stt_ms)
+        if addressed:
+            arm(FOLLOWUP_SECONDS)
 
 
 def run_capslock(s: Session) -> None:
@@ -485,21 +735,24 @@ def run_capslock(s: Session) -> None:
                 s.speaker.say("Permissions granted. Please restart me.")
                 sys.exit(3)
             perms = request_permissions()
-    print(f"⌨️  Hold CAPS LOCK and speak. Tap it to toggle hands-free. (Jev {s.brain.model}, whisper base.en, voice {s.speaker.engine}:{s.speaker.voice})")
+    print(f"⌨️  Hold CAPS LOCK and speak. Tap it to toggle hands-free. (Jev {s.brain.model}, whisper {config.WHISPER_MODEL.stem.removeprefix("ggml-")}, voice {s.speaker.engine}:{s.speaker.voice})")
     s.speaker.say(flavor("Ready."))
-    while True:
-        pcm = done.get()
-        if not s.process(pcm):
+    while not s.stopped():
+        try:
+            pcm = done.get(timeout=0.2)
+        except queue.Empty:
+            continue
+        if not s.submit(pcm):
             break
 
 
 def run_always_on(s: Session) -> None:
-    print(f"🎙  Listening (Jev {s.brain.model}, whisper base.en). Say 'stop listening' to quit.")
+    print(f"🎙  Listening (Jev {s.brain.model}, whisper {config.WHISPER_MODEL.stem.removeprefix("ggml-")}). Say 'stop listening' to quit.")
     s.speaker.say(flavor("Ready."))
     s.listener.pause(0.8)
-    while True:
-        pcm = s.listener.next_utterance()
-        if not s.process(pcm):
+    while not s.stopped():
+        pcm, text, stt_ms = s.capture()
+        if not s.submit(pcm, text, stt_ms):
             break
 
 
@@ -523,7 +776,9 @@ def run_ptt(s: Session) -> None:
         th.start()
         input()
         stop.set(); th.join()
-        if parts and not s.process(np.concatenate(parts)):
+        if parts and not s.submit(np.concatenate(parts)):
+            break
+        if s.stopped():
             break
 
 
@@ -531,7 +786,7 @@ def run_voice(args: argparse.Namespace) -> None:
     global OVERLAY
     if not args.no_overlay and os.environ.get("OVERLAY", "1") not in ("0", "false", "no"):
         from .overlay import Overlay
-        OVERLAY = Overlay()
+        OVERLAY = StatusFeed(Overlay())
 
     def worker() -> None:
         s = Session(args)
